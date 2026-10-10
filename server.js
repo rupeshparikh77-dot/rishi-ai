@@ -8,11 +8,10 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
-const Database = require("@replit/database");
 const Anthropic = require("@anthropic-ai/sdk");
 const Stripe = require("stripe");
 
-const db = new Database();
+const store = require("./store");
 
 /* ---------- Config & secrets ---------- */
 const {
@@ -88,7 +87,7 @@ app.use(express.static("public"));
 /* ---------- Storage helpers ---------- */
 async function getUser(id) {
   try {
-    const u = await db.get("user:" + id);
+    const u = await store.get("user:" + id);
     return u || null;
   } catch (e) {
     return null;
@@ -96,13 +95,13 @@ async function getUser(id) {
 }
 async function saveUser(u) {
   u.updatedAt = Date.now();
-  await db.set("user:" + u.id, u);
-  if (u.stripeCustomerId) await db.set("cust:" + u.stripeCustomerId, u.id);
+  await store.set("user:" + u.id, u);
+  if (u.stripeCustomerId) await store.set("cust:" + u.stripeCustomerId, u.id);
   return u;
 }
 async function userIdByCustomer(customerId) {
   try {
-    return (await db.get("cust:" + customerId)) || null;
+    return (await store.get("cust:" + customerId)) || null;
   } catch (e) {
     return null;
   }
@@ -316,7 +315,7 @@ async function getOrCreatePrice(planKey) {
   if (envId) return envId;
 
   const cacheKey = "price:" + planKey;
-  const cached = await db.get(cacheKey).catch(() => null);
+  const cached = await store.get(cacheKey).catch(() => null);
   if (cached) return cached;
 
   const plan = PLANS[planKey];
@@ -331,7 +330,7 @@ async function getOrCreatePrice(planKey) {
     recurring: { interval: "month" },
     nickname: "RishiAI " + plan.name + " monthly",
   });
-  await db.set(cacheKey, price.id);
+  await store.set(cacheKey, price.id);
   return price.id;
 }
 
@@ -484,13 +483,16 @@ async function handleStripeWebhook(req, res) {
   res.json({ received: true });
 }
 
+/* ---------- Health check ---------- */
+app.get("/healthz", (req, res) => res.json({ ok: true, store: store.backend }));
+
 /* ---------- Fallback to SPA ---------- */
 app.get("*", (req, res) => {
   res.sendFile(require("path").join(__dirname, "public", "index.html"));
 });
 
 app.listen(PORT, () => {
-  console.log("RishiAI running on port " + PORT);
+  console.log("RishiAI running on port " + PORT + " · storage: " + store.backend);
   const miss = [];
   if (!GOOGLE_CLIENT_ID) miss.push("GOOGLE_CLIENT_ID");
   if (!ANTHROPIC_API_KEY) miss.push("ANTHROPIC_API_KEY");
