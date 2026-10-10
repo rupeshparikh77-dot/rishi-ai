@@ -1,6 +1,6 @@
 # RishiAI
 
-A Claude-powered chatbot with real Google sign-in and real Stripe subscriptions.
+A great chatbot with real Google sign-in and real Stripe subscriptions.
 Chat + Co-work modes, a model picker with descriptions, an effort selector, and
 tier-locked models (Free / Pro $18 / MAX $30, each paid plan with a 1-month free trial).
 
