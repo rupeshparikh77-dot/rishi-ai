@@ -49,21 +49,226 @@
   var CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
   var LOCK_SVG = '<svg class="lock-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
 
+  // Inline formatting on a single run of text (escapes first).
+  function inlineMd(s) {
+    s = escapeHtml(s);
+    var codes = [];
+    s = s.replace(/`([^`]+)`/g, function (_, c) { codes.push(c); return "\x01C" + (codes.length - 1) + "\x01"; });
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, t, u) {
+      var safe = /^(https?:|mailto:)/i.test(u) ? u.replace(/"/g, "%22") : "#";
+      return '<a href="' + safe + '" target="_blank" rel="noopener noreferrer">' + t + "</a>";
+    });
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    s = s.replace(/\x01C(\d+)\x01/g, function (_, i) { return "<code>" + codes[+i] + "</code>"; });
+    return s;
+  }
+  function splitRow(l) {
+    return l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(function (c) { return c.trim(); });
+  }
+  function renderTable(header, rows) {
+    var hs = splitRow(header), out = '<div class="table-wrap"><table><thead><tr>';
+    hs.forEach(function (c) { out += "<th>" + inlineMd(c) + "</th>"; });
+    out += "</tr></thead><tbody>";
+    rows.forEach(function (r) {
+      var cs = splitRow(r); out += "<tr>";
+      for (var k = 0; k < hs.length; k++) out += "<td>" + inlineMd(cs[k] || "") + "</td>";
+      out += "</tr>";
+    });
+    return out + "</tbody></table></div>";
+  }
+  function renderCodeBlock(b) {
+    var lang = (b.lang || "").trim();
+    var attr = lang ? ' data-lang="' + escapeHtml(lang) + '"' : "";
+    return '<div class="code-block"' + attr + '><div class="code-bar"><span class="code-lang">' +
+      escapeHtml(lang || "text") + '</span><span class="code-acts"></span></div><pre><code>' +
+      escapeHtml(b.code) + "</code></pre></div>";
+  }
+  function isTableSep(l) { return /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(l); }
+
   function renderMarkdown(text) {
-    var out = [], parts = String(text).split(/```/), i;
-    for (i = 0; i < parts.length; i++) {
-      if (i % 2 === 1) {
-        out.push("<pre><code>" + escapeHtml(parts[i].replace(/^[a-zA-Z0-9]*\n/, "")) + "</code></pre>");
-      } else {
-        var paras = parts[i].split(/\n{2,}/);
-        for (var j = 0; j < paras.length; j++) {
-          var p = paras[j].trim(); if (!p) continue;
-          p = escapeHtml(p).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\n/g, "<br>");
-          out.push("<p>" + p + "</p>");
-        }
-      }
+    text = String(text).replace(/\r\n?/g, "\n");
+    var blocks = [];
+    text = text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, function (_, lang, code) {
+      blocks.push({ lang: (lang || "").trim(), code: code.replace(/\n$/, "") });
+      return "\n\x00CB" + (blocks.length - 1) + "\x00\n";
+    });
+    var lines = text.split("\n"), html = [], i = 0;
+    function special(l) {
+      return /^\s*(#{1,6}\s|>|[-*+]\s|\d+\.\s)/.test(l) ||
+        /^\x00CB\d+\x00$/.test(l.trim()) ||
+        /^\s*([-*_])\s*(\1\s*){2,}$/.test(l);
     }
-    return out.join("");
+    while (i < lines.length) {
+      var line = lines[i];
+      var cb = /^\x00CB(\d+)\x00$/.exec(line.trim());
+      if (cb) { html.push(renderCodeBlock(blocks[+cb[1]])); i++; continue; }
+      if (!line.trim()) { i++; continue; }
+      if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(line)) { html.push("<hr>"); i++; continue; }
+      var h = /^(#{1,6})\s+(.*)$/.exec(line);
+      if (h) { var lv = h[1].length; html.push("<h" + lv + ">" + inlineMd(h[2].trim()) + "</h" + lv + ">"); i++; continue; }
+      if (line.indexOf("|") >= 0 && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+        var header = line; i += 2; var rows = [];
+        while (i < lines.length && lines[i].indexOf("|") >= 0 && lines[i].trim() && !/^\x00CB/.test(lines[i].trim())) { rows.push(lines[i]); i++; }
+        html.push(renderTable(header, rows)); continue;
+      }
+      if (/^\s*>\s?/.test(line)) {
+        var q = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+        html.push("<blockquote>" + renderMarkdown(q.join("\n")) + "</blockquote>"); continue;
+      }
+      if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+        var ordered = /^\s*\d+\.\s+/.test(line), items = [];
+        while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+          items.push("<li>" + inlineMd(lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "")) + "</li>"); i++;
+        }
+        html.push((ordered ? "<ol>" : "<ul>") + items.join("") + (ordered ? "</ol>" : "</ul>")); continue;
+      }
+      var para = [];
+      while (i < lines.length && lines[i].trim() && !special(lines[i]) &&
+             !(lines[i].indexOf("|") >= 0 && i + 1 < lines.length && isTableSep(lines[i + 1]))) {
+        para.push(lines[i]); i++;
+      }
+      if (para.length) html.push("<p>" + inlineMd(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
+    }
+    return html.join("");
+  }
+
+  /* ---------- code block tools: copy / download / shareable link ---------- */
+  var LANG_EXT = {
+    html: "html", htm: "html", svg: "svg", xml: "xml", css: "css",
+    js: "js", javascript: "js", ts: "ts", typescript: "ts", json: "json",
+    py: "py", python: "py", csv: "csv", md: "md", markdown: "md",
+    sql: "sql", sh: "sh", bash: "sh", yaml: "yaml", yml: "yaml", txt: "txt", text: "txt",
+  };
+  function filenameFor(lang) {
+    var ext = LANG_EXT[(lang || "").toLowerCase()] || "txt";
+    var base = ext === "html" ? "page" : ext === "svg" ? "image" : ext === "csv" ? "data" : "file";
+    return base + "." + ext;
+  }
+  function isPreviewable(lang) { var e = LANG_EXT[(lang || "").toLowerCase()]; return e === "html" || e === "svg"; }
+  function downloadText(text, filename) {
+    try {
+      var blob = new Blob([text], { type: "text/plain" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+      setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+    } catch (e) { toast("Download failed."); }
+  }
+  function mkCodeBtn(label) {
+    var b = el("button", "code-act-btn", label); b.type = "button"; return b;
+  }
+
+  // Per-chat stable artifact links: key (filename) -> artifact id, so a
+  // refined version updates the same URL instead of minting a new one.
+  function slotsKey() { return "rishiai.artslots." + (state.me ? state.me.email : "anon") + "." + (state.chatId || "none"); }
+  function getSlots() {
+    try { return JSON.parse(localStorage.getItem(slotsKey()) || "{}"); } catch (e) { return {}; }
+  }
+  function setSlot(key, id) {
+    try { var s = getSlots(); s[key] = id; localStorage.setItem(slotsKey(), JSON.stringify(s)); } catch (e) {}
+  }
+
+  // Build a single working HTML page from an HTML block plus any sibling
+  // CSS/JS blocks in the same message (multi-file -> one page).
+  function mergeDoc(htmlCode, cssList, jsList) {
+    var doc = htmlCode;
+    var styleTag = cssList.length ? "<style>\n" + cssList.join("\n") + "\n</style>" : "";
+    var scriptTag = jsList.length ? "<script>\n" + jsList.join("\n") + "\n<\/script>" : "";
+    if (/<\/head>/i.test(doc) && styleTag) doc = doc.replace(/<\/head>/i, styleTag + "\n</head>");
+    else if (styleTag && /<html[\s>]/i.test(doc)) doc = doc.replace(/(<html[^>]*>)/i, "$1\n<head>" + styleTag + "</head>");
+    else if (styleTag) doc = styleTag + "\n" + doc;
+    if (/<\/body>/i.test(doc) && scriptTag) doc = doc.replace(/<\/body>/i, scriptTag + "\n</body>");
+    else if (scriptTag) doc = doc + "\n" + scriptTag;
+    // If it's a bare fragment, wrap it so it renders predictably.
+    if (!/<html[\s>]/i.test(doc)) {
+      doc = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head><body>" + doc + "</body></html>";
+    }
+    return doc;
+  }
+
+  async function shareArtifact(key, filename, content, btn) {
+    var slots = getSlots();
+    var existing = slots[key];
+    var w = window.open("about:blank", "_blank");
+    try {
+      var resp, created = !existing;
+      if (existing) {
+        resp = await api("/api/artifacts/" + encodeURIComponent(existing), { method: "PUT", body: JSON.stringify({ filename: filename, content: content }) });
+        if (resp.status === 404) { created = true; resp = await api("/api/artifacts", { method: "POST", body: JSON.stringify({ filename: filename, content: content }) }); }
+      } else {
+        resp = await api("/api/artifacts", { method: "POST", body: JSON.stringify({ filename: filename, content: content }) });
+      }
+      var d = await resp.json();
+      if (d.url) {
+        setSlot(key, d.id);
+        if (w) w.location = d.url; else window.location = d.url;
+        toast(created ? "Shareable link created." : "Updated the existing link.");
+      } else { if (w) w.close(); toast(d.error === "too_large" ? "File too large to link." : "Couldn't create link."); }
+    } catch (e) { if (w) w.close(); toast("Couldn't create link."); }
+  }
+
+  function enhanceCodeBlocks(container) {
+    if (!container) return;
+    // Gather all blocks in this message for CSS/JS merging.
+    var allBlocks = Array.prototype.map.call(container.querySelectorAll(".code-block"), function (cb) {
+      return { lang: (cb.getAttribute("data-lang") || "").toLowerCase(), code: cb.querySelector("code").textContent };
+    });
+    var cssList = allBlocks.filter(function (b) { return LANG_EXT[b.lang] === "css"; }).map(function (b) { return b.code; });
+    var jsList = allBlocks.filter(function (b) { return LANG_EXT[b.lang] === "js"; }).map(function (b) { return b.code; });
+
+    container.querySelectorAll(".code-block").forEach(function (cb) {
+      var acts = cb.querySelector(".code-acts");
+      if (!acts || acts.getAttribute("data-done")) return;
+      acts.setAttribute("data-done", "1");
+      var code = cb.querySelector("code").textContent;
+      var lang = (cb.getAttribute("data-lang") || "").toLowerCase();
+      var ext = LANG_EXT[lang] || "txt";
+      var previewable = ext === "html" || ext === "svg";
+
+      // The content used for preview AND for the shareable link.
+      var docContent = ext === "html" ? mergeDoc(code, cssList, jsList) : code;
+
+      // Copy / Download (always).
+      var copy = mkCodeBtn("Copy");
+      copy.addEventListener("click", function () {
+        if (navigator.clipboard && navigator.clipboard.writeText)
+          navigator.clipboard.writeText(code).then(function () { toast("Copied."); }).catch(function () { toast("Copy failed."); });
+      });
+      acts.appendChild(copy);
+      var dl = mkCodeBtn("Download");
+      dl.addEventListener("click", function () { downloadText(code, filenameFor(lang)); });
+      acts.appendChild(dl);
+
+      if (!previewable) return;
+
+      // Preview / Code toggle + inline sandboxed iframe (like Claude's artifact view).
+      var op = mkCodeBtn("Open link");
+      op.addEventListener("click", function () { shareArtifact(filenameFor(lang), filenameFor(lang), docContent, op); });
+      acts.appendChild(op);
+
+      var pre = cb.querySelector("pre");
+      var bar = cb.querySelector(".code-bar");
+      var tabs = el("div", "code-tabs");
+      var tPrev = el("button", "code-tab active", "Preview"); tPrev.type = "button";
+      var tCode = el("button", "code-tab", "Code"); tCode.type = "button";
+      tabs.appendChild(tPrev); tabs.appendChild(tCode);
+      bar.insertBefore(tabs, bar.firstChild.nextSibling); // after the language label
+
+      var frame = document.createElement("iframe");
+      frame.className = "code-preview";
+      frame.setAttribute("sandbox", "allow-scripts allow-forms allow-popups allow-modals");
+      frame.setAttribute("title", "Preview");
+      frame.srcdoc = docContent;
+      cb.insertBefore(frame, pre);
+      pre.hidden = true; // default to preview
+
+      tPrev.addEventListener("click", function () { pre.hidden = true; frame.hidden = false; tPrev.classList.add("active"); tCode.classList.remove("active"); });
+      tCode.addEventListener("click", function () { pre.hidden = false; frame.hidden = true; tCode.classList.add("active"); tPrev.classList.remove("active"); });
+    });
   }
 
   /* ---------- local per-browser prefs (model/effort/mode/draft) ---------- */
@@ -122,7 +327,65 @@
   }
   function updateMeta() {
     var m = modelById(state.modelId);
-    $("#composer-meta").innerHTML = "<b>" + escapeHtml(m.name) + "</b> · " + state.effort.charAt(0).toUpperCase() + state.effort.slice(1) + " effort";
+    var base = "<b>" + escapeHtml(m.name) + "</b> · " + state.effort.charAt(0).toUpperCase() + state.effort.slice(1) + " effort";
+    $("#composer-meta").innerHTML = base + usageMetaSuffix();
+    enforceUsage();
+  }
+  function usageMetaSuffix() {
+    var u = state.usage; if (!u || u.unlimited) return "";
+    if (u.plan === "free") {
+      if (u.blocked) return ' · <span class="usage-warn">Hourly limit reached · resets ' + fmtUntil(u.resetAt) + "</span>";
+      return ' · <span class="usage-dim">' + u.remaining + " of " + u.limit + " left this hour</span>";
+    }
+    if (u.plan === "pro") {
+      if (u.open) return ' · <span class="usage-dim">Pro open · closes ' + fmtUntil(u.resetAt) + "</span>";
+      return ' · <span class="usage-warn">Pro opens ' + fmtUntil(u.resetAt) + "</span>";
+    }
+    return "";
+  }
+  function enforceUsage() {
+    var u = state.usage;
+    var blocked = !!(u && !u.unlimited && u.blocked);
+    var input = $("#input"), send = $("#send");
+    if (!input) return;
+    if (blocked && !state.busy) {
+      input.disabled = true;
+      input.placeholder = u.plan === "pro"
+        ? "Pro is open 12am–6pm (Singapore) · reopens " + fmtUntil(u.resetAt)
+        : "Free limit reached (" + (u.limit || 10) + "/hour) · resets " + fmtUntil(u.resetAt);
+      if (send) send.disabled = true;
+    } else {
+      input.disabled = false;
+      input.placeholder = "Message RishiAI…";
+      updateSendEnabled();
+    }
+  }
+  function fmtUntil(ms) {
+    if (!ms) return "soon";
+    var d = ms - Date.now(); if (d <= 0) return "now";
+    var mins = Math.round(d / 60000);
+    if (mins < 60) return "in " + mins + "m";
+    var h = Math.floor(mins / 60), m = mins % 60;
+    return "in " + h + "h" + (m ? " " + m + "m" : "");
+  }
+  var usageTimer = null;
+  async function loadUsage() {
+    try { var r = await api("/api/usage"); if (r.ok) state.usage = await r.json(); } catch (e) {}
+    updateMeta();
+    scheduleUsageRecheck(state.usage && state.usage.resetAt);
+  }
+  function scheduleUsageRecheck(resetAt) {
+    if (usageTimer) { clearTimeout(usageTimer); usageTimer = null; }
+    if (!resetAt) return;
+    var d = resetAt - Date.now();
+    if (d <= 0) { loadUsage(); return; }
+    usageTimer = setTimeout(loadUsage, Math.min(d + 1500, 15 * 60000)); // cap re-check at 15 min
+  }
+  function handleUsageError(e) {
+    state.usage = { plan: e.plan || "free", unlimited: false, blocked: true, reason: e.reason, resetAt: e.resetAt,
+                    limit: 10, remaining: 0, open: false };
+    updateMeta();
+    scheduleUsageRecheck(e.resetAt);
   }
 
   function renderThread() {
@@ -144,6 +407,7 @@
     var inner = el("div", "thread-inner");
     state.turns.forEach(function (t) { inner.appendChild(bubble(t.role, t.content)); });
     thread.appendChild(inner);
+    enhanceCodeBlocks(inner);
     thread.scrollTop = thread.scrollHeight;
   }
   function bubble(role, content) {
@@ -173,7 +437,7 @@
     });
     if (!resp.ok) {
       var err = {}; try { err = await resp.json(); } catch (e) {}
-      throw { code: err.error || ("http_" + resp.status), minPlan: err.minPlan };
+      throw { code: err.error || ("http_" + resp.status), minPlan: err.minPlan, reason: err.reason, resetAt: err.resetAt, plan: err.plan };
     }
     var reader = resp.body.getReader();
     var dec = new TextDecoder();
@@ -216,19 +480,25 @@
     state.busy = true; setBusy(true);
     try {
       var res = await streamChat(buildMessages(),
-        "You are RishiAI, a helpful, warm and precise AI assistant. Answer clearly and concisely. Use short paragraphs, **bold** for key terms and ```code fences``` for code. You are RishiAI; if asked, say so.",
+        "You are RishiAI, a helpful, warm and precise AI assistant. Answer clearly and concisely with short paragraphs and **bold** for key terms. Use Markdown tables (| col | col |) for any tabular or comparative data. When you write code or create a file (a web page, script, data file, SVG, etc.), put it in a fenced code block tagged with its language or extension (```html, ```python, ```csv, ```svg …) — the app turns these into Copy / Download / shareable-link buttons. You are RishiAI; if asked, say so.",
         function (full) { ct.innerHTML = renderMarkdown(full); thread.scrollTop = thread.scrollHeight; });
       ct.innerHTML = renderMarkdown(res.text + (res.truncated ? "\n\n_(response cut short — raise effort or ask for less.)_" : ""));
+      enhanceCodeBlocks(ct);
       state.turns.push({ role: "assistant", content: res.text }); saveCurrentChat();
+      loadUsage();
     } catch (e) {
-      ct.innerHTML = renderMarkdown(errorText(e));
-      if (e && e.partial) { state.turns.push({ role: "assistant", content: e.partial }); saveCurrentChat(); }
+      if (e && e.code === "usage_limited") { handleUsageError(e); ct.innerHTML = renderMarkdown(errorText(e)); }
+      else { ct.innerHTML = renderMarkdown(errorText(e)); enhanceCodeBlocks(ct); if (e && e.partial) { state.turns.push({ role: "assistant", content: e.partial }); saveCurrentChat(); } }
     } finally { state.busy = false; setBusy(false); currentCtl = null; }
   }
 
   function errorText(e) {
     var c = e && e.code;
     if (c === "cancelled" || (e && e.name === "AbortError")) return "_Stopped._";
+    if (c === "usage_limited") {
+      if (e.reason === "pro_window") return "**Pro hours are 12:00am–6:00pm (Singapore time).** It reopens " + fmtUntil(e.resetAt) + ". Upgrade to MAX for unlimited, any time.";
+      return "**You've used all 10 messages this hour on Free.** Resets " + fmtUntil(e.resetAt) + ". Upgrade to Pro or MAX for more.";
+    }
     if (c === "model_locked" || c === "http_403") return "_That model needs a higher plan._ Upgrade to use it.";
     if (c === "not_authenticated" || c === "http_401") { setTimeout(gateAuth, 600); return "_Your session expired — please sign in again._"; }
     if (c === "rate_limited") return "_Usage limit reached for now. Try again shortly._";
@@ -370,6 +640,7 @@
     renderTopbar(); renderAccount(); updateMeta(); setMode(state.mode);
     updateSendEnabled();
     loadChats();
+    loadUsage();
     $("#input").focus();
   }
 
