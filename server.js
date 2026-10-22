@@ -69,6 +69,85 @@ const planRank = (p) => (PLANS[p] ? PLANS[p].rank : 0);
 
 const EFFORT_TOKENS = { low: 700, medium: 1400, high: 2600 };
 
+/* ---------- Usage limits ----------
+ * Free: FREE_PER_HOUR messages per rolling hour.
+ * Pro:  usable only between midnight and PRO_OPEN_UNTIL_HOUR (00:00–18:00),
+ *       locked the rest of the day, reopens at midnight.
+ * Max / complimentary: unlimited.
+ * All times computed in USAGE_TZ.
+ */
+const USAGE_TZ = process.env.USAGE_TZ || "Asia/Singapore";
+const FREE_PER_HOUR = parseInt(process.env.FREE_PER_HOUR || "10", 10);
+const PRO_OPEN_UNTIL_HOUR = parseInt(process.env.PRO_OPEN_UNTIL_HOUR || "18", 10);
+const HOUR_MS = 3600 * 1000;
+
+function tzParts(tz) {
+  const f = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const p = {};
+  f.formatToParts(new Date()).forEach((x) => { p[x.type] = x.value; });
+  return { h: (parseInt(p.hour, 10) % 24), m: +p.minute, s: +p.second };
+}
+function localHour(tz) { return tzParts(tz).h; }
+// ms from now until the local clock next reads `hour:00:00`.
+function msUntilLocalHour(tz, hour) {
+  const t = tzParts(tz);
+  const nowS = t.h * 3600 + t.m * 60 + t.s;
+  let diff = hour * 3600 - nowS;
+  if (diff <= 0) diff += 86400;
+  return Date.now() + diff * 1000;
+}
+function proOpen() { return localHour(USAGE_TZ) < PRO_OPEN_UNTIL_HOUR; }
+
+async function freeRecent(userId) {
+  let list = [];
+  try { list = (await store.get("usage:" + userId)) || []; } catch (e) {}
+  const windowStart = Date.now() - HOUR_MS;
+  const recent = list.filter((t) => t > windowStart);
+  const resetAt = recent.length ? Math.min.apply(null, recent) + HOUR_MS : null;
+  return { recent, resetAt };
+}
+async function recordFreeUsage(userId) {
+  const { recent } = await freeRecent(userId);
+  recent.push(Date.now());
+  try { await store.set("usage:" + userId, recent); } catch (e) {}
+}
+// Decide whether this user may send a message right now.
+async function usageGate(user) {
+  const plan = effectivePlan(user);
+  if (user.comp || plan === "max") return { allowed: true, unlimited: true };
+  if (plan === "pro") {
+    if (proOpen()) return { allowed: true };
+    return { allowed: false, reason: "pro_window", resetAt: msUntilLocalHour(USAGE_TZ, 0) };
+  }
+  // free
+  const { recent, resetAt } = await freeRecent(user.id);
+  if (recent.length >= FREE_PER_HOUR) return { allowed: false, reason: "free_hourly", resetAt };
+  return { allowed: true, free: true };
+}
+// Snapshot for the UI.
+async function usageSnapshot(user) {
+  const plan = effectivePlan(user);
+  if (user.comp || plan === "max") return { plan: "max", unlimited: true, blocked: false };
+  if (plan === "pro") {
+    const open = proOpen();
+    return {
+      plan: "pro", unlimited: false, mode: "overnight", open,
+      blocked: !open,
+      openUntilHour: PRO_OPEN_UNTIL_HOUR,
+      resetAt: open ? msUntilLocalHour(USAGE_TZ, PRO_OPEN_UNTIL_HOUR) : msUntilLocalHour(USAGE_TZ, 0),
+    };
+  }
+  const { recent, resetAt } = await freeRecent(user.id);
+  const remaining = Math.max(0, FREE_PER_HOUR - recent.length);
+  return {
+    plan: "free", unlimited: false, limit: FREE_PER_HOUR,
+    used: recent.length, remaining, blocked: remaining <= 0, resetAt,
+  };
+}
+
 /* ---------- App ---------- */
 const app = express();
 app.set("trust proxy", 1);
@@ -80,7 +159,7 @@ app.post(
   handleStripeWebhook
 );
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "4mb" }));
 app.use(cookieParser());
 app.use(express.static("public"));
 
@@ -373,6 +452,12 @@ app.post("/api/chat", requireAuth, async (req, res) => {
   if (planRank(plan) < planRank(model.minPlan))
     return res.status(403).json({ error: "model_locked", minPlan: model.minPlan });
 
+  // Usage limits (Free hourly cap / Pro overnight window / Max unlimited).
+  const gate = await usageGate(req.user);
+  if (!gate.allowed)
+    return res.status(429).json({ error: "usage_limited", reason: gate.reason, resetAt: gate.resetAt, plan });
+  if (gate.free) await recordFreeUsage(req.user.id);
+
   // Sanitize turns.
   const turns = messages
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
@@ -385,7 +470,11 @@ app.post("/api/chat", requireAuth, async (req, res) => {
   const sys =
     (typeof system === "string" && system.slice(0, 4000)) ||
     "You are RishiAI, a helpful, warm and precise AI assistant. Answer clearly " +
-      "and concisely. Use short paragraphs, **bold** for key terms and ```code fences``` for code.";
+      "and concisely. Use short paragraphs and **bold** for key terms. Use Markdown " +
+      "tables (| col | col |) for any tabular or comparative data. Put code and any file " +
+      "you create in a fenced code block tagged with its language or extension " +
+      "(```html, ```python, ```csv, ```svg …); the app turns these into downloadable, " +
+      "shareable links.";
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -593,6 +682,68 @@ async function handleStripeWebhook(req, res) {
   }
   res.json({ received: true });
 }
+
+/* ---------- Usage snapshot ---------- */
+app.get("/api/usage", requireAuth, async (req, res) => {
+  res.json(await usageSnapshot(req.user));
+});
+
+/* ---------- Artifacts (generated files / pages with a shareable link) ----------
+ * POST /api/artifacts  (auth)  -> stores content, returns a public URL
+ * GET  /a/:id          (public) -> serves it; HTML/SVG render, sandboxed
+ */
+const EXT_TYPES = {
+  html: "text/html", htm: "text/html", svg: "image/svg+xml",
+  css: "text/css", js: "text/javascript", mjs: "text/javascript",
+  json: "application/json", csv: "text/csv", md: "text/markdown",
+  txt: "text/plain", xml: "application/xml",
+};
+const ARTIFACT_MAX = 3 * 1024 * 1024; // 3 MB
+function extOf(name) { const m = /\.([a-z0-9]+)$/i.exec(name || ""); return m ? m[1].toLowerCase() : ""; }
+
+app.post("/api/artifacts", requireAuth, async (req, res) => {
+  const body = req.body || {};
+  const content = typeof body.content === "string" ? body.content : "";
+  if (!content) return res.status(400).json({ error: "empty" });
+  if (content.length > ARTIFACT_MAX) return res.status(400).json({ error: "too_large" });
+  const filename = (body.filename && String(body.filename).slice(0, 80)) || "file.txt";
+  const contentType = EXT_TYPES[extOf(filename)] || "text/plain";
+  const id = newId();
+  await store.set("artifact:" + id, {
+    content, contentType, filename, userId: req.user.id, createdAt: Date.now(),
+  });
+  res.json({ id, filename, contentType, url: baseUrl(req) + "/a/" + id });
+});
+
+// Update an existing artifact in place (keeps the same /a/:id link).
+app.put("/api/artifacts/:id", requireAuth, async (req, res) => {
+  let a = null;
+  try { a = await store.get("artifact:" + req.params.id); } catch (e) {}
+  if (!a) return res.status(404).json({ error: "not_found" });
+  if (a.userId !== req.user.id) return res.status(403).json({ error: "forbidden" });
+  const content = typeof (req.body || {}).content === "string" ? req.body.content : "";
+  if (!content) return res.status(400).json({ error: "empty" });
+  if (content.length > ARTIFACT_MAX) return res.status(400).json({ error: "too_large" });
+  const filename = (req.body.filename && String(req.body.filename).slice(0, 80)) || a.filename;
+  a.content = content;
+  a.filename = filename;
+  a.contentType = EXT_TYPES[extOf(filename)] || a.contentType;
+  a.updatedAt = Date.now();
+  await store.set("artifact:" + req.params.id, a);
+  res.json({ id: req.params.id, filename, contentType: a.contentType, url: baseUrl(req) + "/a/" + req.params.id });
+});
+
+app.get("/a/:id", async (req, res) => {
+  let a = null;
+  try { a = await store.get("artifact:" + req.params.id); } catch (e) {}
+  if (!a) return res.status(404).type("text/plain").send("This link has expired or does not exist.");
+  // Sandbox to a unique origin so page scripts can't touch the app's cookies/session.
+  res.setHeader("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.type(a.contentType + (/^text\//.test(a.contentType) ? "; charset=utf-8" : ""));
+  res.send(a.content);
+});
 
 /* ---------- Health check ---------- */
 app.get("/healthz", (req, res) => res.json({ ok: true, store: store.backend }));
