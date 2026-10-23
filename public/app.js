@@ -95,6 +95,12 @@
       blocks.push({ lang: (lang || "").trim(), code: code.replace(/\n$/, "") });
       return "\n\x00CB" + (blocks.length - 1) + "\x00\n";
     });
+    // An unclosed trailing fence (while streaming, or if a reply is truncated)
+    // still renders as a code block rather than raw ``` text.
+    text = text.replace(/```([^\n`]*)\n?([\s\S]*)$/, function (_, lang, code) {
+      blocks.push({ lang: (lang || "").trim(), code: code.replace(/\n$/, "") });
+      return "\n\x00CB" + (blocks.length - 1) + "\x00\n";
+    });
     var lines = text.split("\n"), html = [], i = 0;
     function special(l) {
       return /^\s*(#{1,6}\s|>|[-*+]\s|\d+\.\s)/.test(l) ||
