@@ -67,7 +67,8 @@ const PLANS = {
 };
 const planRank = (p) => (PLANS[p] ? PLANS[p].rank : 0);
 
-const EFFORT_TOKENS = { low: 700, medium: 1400, high: 2600 };
+// Max output tokens per reply by effort. Generous so code/files aren't truncated.
+const EFFORT_TOKENS = { low: 2048, medium: 8192, high: 16384 };
 
 /* ---------- Usage limits ----------
  * Free: FREE_PER_HOUR messages per rolling hour.
