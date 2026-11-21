@@ -1,6 +1,6 @@
 # RishiAI
 
-A Claude-style AI chat web app you own and host yourself.
+A great AI chat web app you own and host yourself.
 
 - **Guest accounts** (no sign-up) and **Google sign-in**
 - Chats stored in **Neon Postgres**
