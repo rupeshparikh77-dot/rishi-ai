@@ -9,7 +9,8 @@ A Claude-style AI chat web app you own and host yourself.
   side-panel with Preview (sandboxed iframe) + Code tabs, copy & download
 - Streaming replies, markdown + code highlighting, multiple conversations,
   model picker, custom instructions, dark mode, live quota display
-- Works with any **OpenAI-compatible** model provider (OpenAI, OpenRouter, Together, Groq, …)
+- **The AI runs in the visitor's browser** (WebLLM / WebGPU) — no API key,
+  no provider, no AI cost. Nothing external does the thinking.
 
 Everything below is done through web dashboards — **no terminal required.**
 
@@ -52,21 +53,18 @@ Then you put the code on **GitHub** and deploy on **Render**.
    `postgresql://user:pass@...neon.tech/dbname?sslmode=require`). Keep it for later.
    - Tables are created automatically the first time the server starts — nothing else to do.
 
-### 3. Get an AI API key
-The defaults use **Anthropic's Claude** (via its OpenAI-compatible endpoint).
-1. Sign in at **platform.claude.com**, add credit under **Billing** (prepaid).
-2. **API keys → Create Key**, copy the `sk-ant-...` string.
-3. Keep `AI_BASE_URL=https://api.anthropic.com/v1`,
-   `AI_MODELS=claude-sonnet-4-6,claude-opus-5-5`,
-   `AI_DEFAULT_MODEL=claude-sonnet-4-6`.
-   - If you get a "workspace" auth error, your key isn't scoped to a workspace:
-     either create the key inside a Workspace in the console, or set
-     `AI_WORKSPACE_ID` to your workspace ID.
+### 3. The AI — nothing to set up
+RishiAI runs the language model **in the visitor's own browser** using WebLLM
+(WebGPU). There is **no API key, no provider, and no AI cost.** The first time
+someone chats, their browser downloads a small open model (≈1–2 GB, cached after
+that) and runs it on their own device.
 
-**Other providers** (no code change — just swap env vars):
-- **OpenAI:** `AI_BASE_URL=https://api.openai.com/v1`, `AI_MODELS=gpt-4o-mini,gpt-4o`.
-- **OpenRouter:** `AI_BASE_URL=https://openrouter.ai/api/v1`, models like
-  `openai/gpt-4o-mini,anthropic/claude-3.5-sonnet`.
+Requirements for the chatter: a modern desktop/laptop browser with WebGPU
+(recent Chrome or Edge). The model picker in the app offers a few sizes
+(Llama 3.2 1B/3B, Qwen 2.5). Smaller = faster; larger = smarter.
+
+> Trade-off vs. a cloud model: in-browser models are smaller, so answers are
+> simpler and slower than Claude/GPT. The upside is zero cost and no third party.
 
 ### 4. Google sign-in
 1. Go to console.cloud.google.com → **APIs & Services → Credentials**.

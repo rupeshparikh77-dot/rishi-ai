@@ -91,6 +91,9 @@ body {
 /* ── Composer ── */
 .composer-wrap { padding: 0 16px 10px; }
 .banner { max-width: 760px; margin: 0 auto 8px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 13px; color: var(--text-dim); }
+.model-status { max-width: 760px; margin: 0 auto 8px; background: var(--bg-elev); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 14px; font-size: 13px; color: var(--text); display: flex; flex-direction: column; gap: 6px; }
+.model-status .ms-bar { height: 6px; border-radius: 4px; background: var(--border); overflow: hidden; }
+.model-status .ms-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.2s; }
 .composer { max-width: 760px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 8px 8px 16px; }
 .composer textarea { flex: 1; resize: none; border: none; background: transparent; color: var(--text); font-size: 15px; font-family: inherit; max-height: 200px; outline: none; padding: 8px 0; }
 .send-btn { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 10px; border: none; background: var(--accent); color: var(--accent-ink); cursor: pointer; font-size: 16px; }

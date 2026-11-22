@@ -3,7 +3,33 @@ let me = null;
 let currentConversationId = null;
 let currentModel = null;
 let systemPrompt = localStorage.getItem('systemPrompt') || '';
-let abortController = null;
+let generating = false;
+
+// WebLLM engine (the AI runs here, in the browser)
+let engine = null;
+let engineModel = null;
+let webllmModPromise = null;
+
+const SYSTEM_PROMPT =
+  'You are RishiAI, a helpful AI assistant. When you produce a complete, ' +
+  'self-contained document, web page, or code file (especially HTML or SVG), ' +
+  'put it in a single fenced code block with a correct language tag (e.g. ```html) ' +
+  'so the interface can render it as a live, previewable artifact. Keep prose outside the code block.';
+
+// Preferred models, best-first. We match these against WebLLM's live model list
+// so the IDs are always valid for whatever library version loads.
+const MODEL_PREFS = [
+  { match: 'Llama-3.2-1B-Instruct', label: 'Llama 3.2 1B · fastest (~0.9 GB)' },
+  { match: 'Qwen2.5-1.5B-Instruct', label: 'Qwen2.5 1.5B · balanced (~1.1 GB)' },
+  { match: 'Llama-3.2-3B-Instruct', label: 'Llama 3.2 3B · smarter (~2.3 GB)' },
+  { match: 'Phi-3.5-mini-instruct', label: 'Phi-3.5 mini · smarter (~2.2 GB)' },
+];
+const MODEL_FALLBACK = [
+  { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', label: 'Llama 3.2 1B · fastest (~0.9 GB)' },
+  { id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5 1.5B · balanced (~1.1 GB)' },
+  { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', label: 'Llama 3.2 3B · smarter (~2.3 GB)' },
+];
+let modelOptions = []; // [{id,label}]
 
 const $ = (id) => document.getElementById(id);
 
@@ -32,6 +58,70 @@ $('btn-theme').onclick = () => {
   applyTheme(cur === 'dark' ? 'light' : 'dark');
 };
 
+// ── WebLLM loading ──
+function loadWebllm() {
+  if (!webllmModPromise) webllmModPromise = import('https://esm.run/@mlc-ai/web-llm');
+  return webllmModPromise;
+}
+
+function modelLabel(id) {
+  const m = modelOptions.find((o) => o.id === id);
+  return m ? m.label : id;
+}
+
+function setModelStatus(text, pct) {
+  const el = $('model-status');
+  el.classList.remove('hidden');
+  el.innerHTML = `<span>${escapeHtml(text)}</span><div class="ms-bar"><div class="ms-fill" style="width:${pct || 0}%"></div></div>`;
+}
+function hideModelStatus() { $('model-status').classList.add('hidden'); }
+
+async function ensureEngine(modelId) {
+  if (engine && engineModel === modelId) return engine;
+  if (!('gpu' in navigator) || !navigator.gpu) {
+    const e = new Error('NO_WEBGPU'); e.code = 'NO_WEBGPU'; throw e;
+  }
+  const webllm = await loadWebllm();
+  if (engine) { try { await engine.unload(); } catch (_) {} engine = null; engineModel = null; }
+  setModelStatus('Preparing ' + modelLabel(modelId) + '… first load downloads the model (once).', 1);
+  engine = await webllm.CreateMLCEngine(modelId, {
+    initProgressCallback: (r) => {
+      const pct = Math.round((r.progress || 0) * 100);
+      setModelStatus((r.text || 'Loading model') + (pct ? ' · ' + pct + '%' : ''), pct);
+    },
+  });
+  engineModel = modelId;
+  hideModelStatus();
+  return engine;
+}
+
+// Build the model picker from WebLLM's live catalog (falls back if offline).
+async function initModels() {
+  const sel = $('model-select');
+  modelOptions = [];
+  try {
+    const webllm = await loadWebllm();
+    const list = (webllm.prebuiltAppConfig && webllm.prebuiltAppConfig.model_list) || [];
+    const ids = list.map((m) => m.model_id);
+    for (const pref of MODEL_PREFS) {
+      const hit = ids.find((id) => id.includes(pref.match) && id.includes('q4f16_1')) ||
+                  ids.find((id) => id.includes(pref.match));
+      if (hit && !modelOptions.some((o) => o.id === hit)) modelOptions.push({ id: hit, label: pref.label });
+    }
+  } catch (_) { /* offline / import failed — use fallback below */ }
+  if (modelOptions.length === 0) modelOptions = MODEL_FALLBACK.slice();
+
+  sel.innerHTML = '';
+  modelOptions.forEach((o) => {
+    const opt = document.createElement('option');
+    opt.value = o.id; opt.textContent = o.label;
+    sel.appendChild(opt);
+  });
+  currentModel = modelOptions[0].id;
+  sel.value = currentModel;
+  sel.onchange = () => { currentModel = sel.value; }; // engine reloads lazily on next send
+}
+
 // ── Boot ──
 async function boot() {
   const res = await fetch('/api/me');
@@ -43,24 +133,18 @@ async function boot() {
     return;
   }
   me = data.user;
-  currentModel = data.defaultModel;
   $('auth-screen').classList.add('hidden');
   $('app').classList.remove('hidden');
 
-  // Model picker
-  const sel = $('model-select');
-  sel.innerHTML = '';
-  (data.models || []).forEach((m) => {
-    const opt = document.createElement('option');
-    opt.value = m; opt.textContent = m;
-    if (m === currentModel) opt.selected = true;
-    sel.appendChild(opt);
-  });
-  sel.onchange = () => { currentModel = sel.value; };
+  await initModels();
 
   $('user-name').textContent = me.name + (me.email ? ` · ${me.email}` : '');
   renderQuota(data.quota);
   await loadConversations();
+
+  if (!('gpu' in navigator) || !navigator.gpu) {
+    showBanner('Heads up: this browser can’t run the in-browser model (no WebGPU). Use Chrome or Edge on a desktop/laptop to chat.');
+  }
 }
 
 function renderQuota(q) {
@@ -116,7 +200,6 @@ async function openConversation(id) {
   const res = await fetch(`/api/conversations/${id}`);
   const data = await res.json();
   $('messages').innerHTML = '';
-  $('empty-state').classList.add('hidden');
   data.messages.forEach((m) => addMessage(m.role, m.content));
   loadConversations();
   closeSidebar();
@@ -172,7 +255,6 @@ function escapeHtml(s) { const d = document.createElement('div'); d.textContent 
 const artifacts = {};
 let artifactSeq = 0;
 
-// Turn qualifying code blocks in a rendered message into artifact cards.
 function processArtifacts(bodyEl) {
   bodyEl.querySelectorAll('pre').forEach((pre) => {
     const codeEl = pre.querySelector('code');
@@ -183,7 +265,7 @@ function processArtifacts(bodyEl) {
     const lines = code.split('\n').length;
     const isWeb = ['html', 'svg', 'xml'].includes(lang) || /^\s*(<!doctype html|<html[\s>]|<svg[\s>])/i.test(code);
     const big = lines >= 15;
-    if (!isWeb && !big) return; // keep short snippets inline
+    if (!isWeb && !big) return;
 
     const id = 'a' + (++artifactSeq);
     const kind = isWeb ? 'web' : 'code';
@@ -262,77 +344,98 @@ input.addEventListener('keydown', (e) => {
 $('composer').onsubmit = async (e) => {
   e.preventDefault();
   const text = input.value.trim();
-  if (!text || abortController) return;
+  if (!text || generating) return;
 
-  addMessage('user', text);
+  if (!('gpu' in navigator) || !navigator.gpu) {
+    showBanner('This browser can’t run the in-browser model (no WebGPU). Use Chrome or Edge on a desktop/laptop.');
+    return;
+  }
+
+  const userBody = addMessage('user', text);
   input.value = '';
   input.style.height = 'auto';
   $('banner').classList.add('hidden');
 
-  const assistantBody = addMessage('assistant', '');
-  assistantBody.classList.add('cursor-blink');
-  let full = '';
-
-  toggleSending(true);
-  abortController = new AbortController();
-
+  // Step 1: save the user message + enforce quota, get conversation history.
+  let data;
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: currentConversationId, message: text, model: currentModel, systemPrompt }),
-      signal: abortController.signal,
+    const r = await fetch('/api/chat/user', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: currentConversationId, message: text }),
     });
-
-    if (res.status === 429) {
-      const err = await res.json();
-      assistantBody.closest('.msg').remove();
+    if (r.status === 429) {
+      const err = await r.json();
+      userBody.closest('.msg').remove();
       showBanner(err.error || 'Limit reached.');
       await refreshQuota();
       return;
     }
-    if (!res.ok || !res.body) { assistantBody.textContent = 'Error contacting server.'; return; }
+    if (!r.ok) { userBody.closest('.msg').remove(); showBanner('Server error saving message.'); return; }
+    data = await r.json();
+  } catch (_) {
+    userBody.closest('.msg').remove();
+    showBanner('Connection error.');
+    return;
+  }
+  currentConversationId = data.conversationId;
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop();
-      for (const part of parts) {
-        const lines = part.split('\n');
-        const event = (lines.find((l) => l.startsWith('event:')) || '').slice(6).trim();
-        const dataLine = (lines.find((l) => l.startsWith('data:')) || '').slice(5).trim();
-        if (!dataLine) continue;
-        const payload = JSON.parse(dataLine);
-        if (event === 'meta') { currentConversationId = payload.conversationId; }
-        else if (event === 'delta') {
-          full += payload.text;
-          assistantBody.classList.remove('cursor-blink');
-          assistantBody.innerHTML = renderMarkdown(full);
-          scrollDown();
-        } else if (event === 'error') { assistantBody.innerHTML = renderMarkdown('⚠️ ' + payload.error); }
+  // Step 2: generate the reply locally, in the browser.
+  const assistantBody = addMessage('assistant', '');
+  assistantBody.classList.add('cursor-blink');
+  let full = '';
+  generating = true;
+  toggleSending(true);
+
+  try {
+    const eng = await ensureEngine(currentModel);
+    const msgs = [{ role: 'system', content: SYSTEM_PROMPT + (systemPrompt ? '\n\n' + systemPrompt : '') }];
+    data.messages.forEach((m) => msgs.push({ role: m.role, content: m.content }));
+
+    const chunks = await eng.chat.completions.create({
+      messages: msgs, stream: true, temperature: 0.7, max_tokens: 1024,
+    });
+    for await (const chunk of chunks) {
+      const d = (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content) || '';
+      if (d) {
+        full += d;
+        assistantBody.classList.remove('cursor-blink');
+        assistantBody.innerHTML = renderMarkdown(full);
+        scrollDown();
       }
     }
+  } catch (err) {
     assistantBody.classList.remove('cursor-blink');
+    if (err && err.code === 'NO_WEBGPU') {
+      assistantBody.innerHTML = renderMarkdown('⚠️ This browser can’t run the model (no WebGPU). Use Chrome or Edge on a desktop/laptop.');
+    } else if (!/interrupt/i.test(String(err && err.message))) {
+      assistantBody.innerHTML = renderMarkdown('⚠️ Model error: ' + escapeHtml(String(err && err.message || 'unknown')));
+    }
+    hideModelStatus();
+  }
+
+  assistantBody.classList.remove('cursor-blink');
+  if (full) {
     assistantBody.innerHTML = renderMarkdown(full);
     processArtifacts(assistantBody);
     addCopyButton(assistantBody.closest('.msg'), () => full);
-    await loadConversations();
-    await refreshQuota();
-  } catch (err) {
-    if (err.name === 'AbortError') { assistantBody.classList.remove('cursor-blink'); }
-    else { assistantBody.textContent = 'Connection error.'; }
-  } finally {
-    toggleSending(false);
-    abortController = null;
+    // Step 3: persist the assistant reply.
+    try {
+      await fetch('/api/chat/assistant', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: currentConversationId, content: full }),
+      });
+    } catch (_) {}
   }
+
+  generating = false;
+  toggleSending(false);
+  await loadConversations();
+  await refreshQuota();
 };
 
-$('btn-stop').onclick = () => { if (abortController) abortController.abort(); };
+$('btn-stop').onclick = () => {
+  if (engine && generating) { try { engine.interruptGenerate(); } catch (_) {} }
+};
 
 function toggleSending(sending) {
   $('btn-send').classList.toggle('hidden', sending);

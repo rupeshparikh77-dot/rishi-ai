@@ -47,7 +47,6 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         const status = sub.status;
-        // Map the active price back to a tier.
         let tier = 'free';
         const priceId = sub.items && sub.items.data[0] && sub.items.data[0].price.id;
         if (status === 'active' || status === 'trialing') {
@@ -69,7 +68,7 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
   res.json({ received: true });
 });
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 // ── Sessions stored in Neon ──
 app.use(
@@ -113,7 +112,6 @@ if (config.google.enabled) {
           const email = profile.emails && profile.emails[0] && profile.emails[0].value;
           const name = profile.displayName;
           const avatar = profile.photos && profile.photos[0] && profile.photos[0].value;
-          // Find by google_id, then by email, else create.
           let { rows } = await db.query('SELECT * FROM users WHERE google_id = $1', [profile.id]);
           if (!rows[0] && email) {
             ({ rows } = await db.query('SELECT * FROM users WHERE email = $1', [email]));
@@ -147,7 +145,6 @@ function requireUser(req, res, next) {
   res.status(401).json({ error: 'Not signed in' });
 }
 
-// Create a guest account and log in.
 app.post('/api/auth/guest', async (req, res, next) => {
   try {
     const { rows } = await db.query(
@@ -191,8 +188,6 @@ app.get('/api/me', async (req, res) => {
       tier: req.user.tier,
     },
     quota: summary,
-    models: config.ai.models,
-    defaultModel: config.ai.defaultModel,
     googleEnabled: config.google.enabled,
     stripeEnabled: config.stripe.enabled,
   });
@@ -232,24 +227,23 @@ app.delete('/api/conversations/:id', requireUser, async (req, res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// Chat (streaming via Server-Sent Events)
-// body: { conversationId?, message, model?, systemPrompt? }
+// Chat — the AI runs in the visitor's BROWSER (WebLLM), not here.
+// The server only: checks the tier limit, stores the user's message,
+// returns recent history for context, and later stores the reply.
 // ─────────────────────────────────────────────────────────────
-app.post('/api/chat', requireUser, async (req, res, next) => {
-  const { message, model, systemPrompt } = req.body || {};
+
+// Step 1: user sends a message. Enforce quota, save it, return history.
+app.post('/api/chat/user', requireUser, async (req, res, next) => {
+  const { message } = req.body || {};
   let { conversationId } = req.body || {};
   if (!message || !message.trim()) return res.status(400).json({ error: 'Empty message' });
 
-  // Enforce tier limits.
   const gate = await quota.checkQuota(req.user);
   if (!gate.allowed) {
     return res.status(429).json({ error: gate.reason, resetAt: gate.resetAt, tier: req.user.tier });
   }
 
-  const chosenModel = config.ai.models.includes(model) ? model : config.ai.defaultModel;
-
   try {
-    // Create a conversation if needed, titled from the first message.
     if (!conversationId) {
       const title = message.trim().slice(0, 60);
       const { rows } = await db.query(
@@ -262,99 +256,35 @@ app.post('/api/chat', requireUser, async (req, res, next) => {
       if (!own.rows[0]) return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    // Persist the user's message and count it toward quota.
     await db.query('INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)', [
       conversationId, 'user', message,
     ]);
     await quota.recordMessage(req.user.id);
 
-    // Build the context sent to the model (recent history).
     const history = await db.query(
       `SELECT role, content FROM messages WHERE conversation_id = $1 AND role <> 'system'
-        ORDER BY created_at DESC LIMIT 30`,
+        ORDER BY created_at DESC LIMIT 20`,
       [conversationId]
     );
-    const ordered = history.rows.reverse();
-    const apiMessages = [];
-    const baseSystem =
-      'You are RishiAI, a helpful AI assistant. When you produce a complete, ' +
-      'self-contained document, web page, or code file (especially HTML or SVG), ' +
-      'put it in a single fenced code block with a correct language tag (e.g. ```html). ' +
-      'The interface renders such blocks as a live, previewable artifact, so keep ' +
-      'explanatory prose outside the code block.';
-    const combinedSystem = [baseSystem, (systemPrompt || '').trim()].filter(Boolean).join('\n\n');
-    apiMessages.push({ role: 'system', content: combinedSystem });
-    for (const m of ordered) apiMessages.push({ role: m.role, content: m.content });
+    res.json({ conversationId, messages: history.rows.reverse() });
+  } catch (e) { next(e); }
+});
 
-    // Open the SSE stream to the browser.
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders && res.flushHeaders();
-    res.write(`event: meta\ndata: ${JSON.stringify({ conversationId })}\n\n`);
-
-    // Call the AI provider with streaming enabled.
-    const aiHeaders = {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.ai.apiKey}`,
-    };
-    // Anthropic requires this header when the key isn't scoped to a workspace.
-    if (config.ai.workspaceId) aiHeaders['anthropic-workspace-id'] = config.ai.workspaceId;
-
-    const upstream = await fetch(`${config.ai.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: aiHeaders,
-      body: JSON.stringify({ model: chosenModel, messages: apiMessages, stream: true }),
-    });
-
-    if (!upstream.ok || !upstream.body) {
-      const errText = await upstream.text().catch(() => '');
-      console.error('[ai] upstream error', upstream.status, errText);
-      res.write(`event: error\ndata: ${JSON.stringify({ error: 'AI provider error. Check AI_API_KEY / AI_MODEL.' })}\n\n`);
-      return res.end();
-    }
-
-    let full = '';
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        if (data === '[DONE]') continue;
-        try {
-          const json = JSON.parse(data);
-          const delta = json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content;
-          if (delta) {
-            full += delta;
-            res.write(`event: delta\ndata: ${JSON.stringify({ text: delta })}\n\n`);
-          }
-        } catch (_) { /* ignore keep-alive / partial */ }
-      }
-    }
-
-    // Save the assistant reply and bump the conversation timestamp.
+// Step 2: browser finished generating. Store the assistant's reply.
+app.post('/api/chat/assistant', requireUser, async (req, res, next) => {
+  const { conversationId, content } = req.body || {};
+  if (!conversationId || typeof content !== 'string' || !content.trim()) {
+    return res.status(400).json({ error: 'Missing conversationId or content' });
+  }
+  try {
+    const own = await db.query('SELECT id FROM conversations WHERE id = $1 AND user_id = $2', [conversationId, req.user.id]);
+    if (!own.rows[0]) return res.status(404).json({ error: 'Conversation not found' });
     await db.query('INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)', [
-      conversationId, 'assistant', full,
+      conversationId, 'assistant', content,
     ]);
     await db.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [conversationId]);
-
-    res.write(`event: done\ndata: ${JSON.stringify({ conversationId })}\n\n`);
-    res.end();
-  } catch (e) {
-    console.error('[chat] error', e);
-    if (!res.headersSent) return next(e);
-    res.write(`event: error\ndata: ${JSON.stringify({ error: 'Server error during generation.' })}\n\n`);
-    res.end();
-  }
+    res.json({ ok: true });
+  } catch (e) { next(e); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -381,7 +311,6 @@ app.post('/api/billing/checkout', requireUser, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Let the user manage/cancel their subscription in Stripe's portal.
 app.post('/api/billing/portal', requireUser, async (req, res, next) => {
   if (!stripe) return res.status(400).json({ error: 'Billing not configured' });
   if (!req.user.stripe_customer_id) return res.status(400).json({ error: 'No subscription found' });
