@@ -294,12 +294,16 @@ app.post('/api/chat', requireUser, async (req, res, next) => {
     res.write(`event: meta\ndata: ${JSON.stringify({ conversationId })}\n\n`);
 
     // Call the AI provider with streaming enabled.
+    const aiHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.ai.apiKey}`,
+    };
+    // Anthropic requires this header when the key isn't scoped to a workspace.
+    if (config.ai.workspaceId) aiHeaders['anthropic-workspace-id'] = config.ai.workspaceId;
+
     const upstream = await fetch(`${config.ai.baseUrl}/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.ai.apiKey}`,
-      },
+      headers: aiHeaders,
       body: JSON.stringify({ model: chosenModel, messages: apiMessages, stream: true }),
     });
 

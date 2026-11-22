@@ -6,7 +6,7 @@ function required(name) {
   return v;
 }
 
-const models = (process.env.AI_MODELS || 'gpt-4o-mini')
+const models = (process.env.AI_MODELS || 'claude-sonnet-4-6,claude-opus-5-5')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -20,10 +20,12 @@ module.exports = {
   databaseUrl: required('DATABASE_URL'),
 
   ai: {
-    baseUrl: (process.env.AI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
+    baseUrl: (process.env.AI_BASE_URL || 'https://api.anthropic.com/v1').replace(/\/$/, ''),
     apiKey: required('AI_API_KEY'),
     models,
     defaultModel: process.env.AI_DEFAULT_MODEL || models[0],
+    // Only needed for Anthropic keys not scoped to a workspace.
+    workspaceId: process.env.AI_WORKSPACE_ID || null,
   },
 
   google: {

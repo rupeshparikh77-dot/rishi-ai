@@ -1,6 +1,6 @@
 # RishiAI
 
-A great AI chat web app you own and host yourself.
+A Claude-style AI chat web app you own and host yourself.
 
 - **Guest accounts** (no sign-up) and **Google sign-in**
 - Chats stored in **Neon Postgres**
@@ -53,10 +53,20 @@ Then you put the code on **GitHub** and deploy on **Render**.
    - Tables are created automatically the first time the server starts — nothing else to do.
 
 ### 3. Get an AI API key
-- **OpenAI:** create a key at platform.openai.com → keep `AI_BASE_URL=https://api.openai.com/v1`.
-- **Or OpenRouter** (access to many models): key from openrouter.ai, set
-  `AI_BASE_URL=https://openrouter.ai/api/v1` and put model names like
-  `openai/gpt-4o-mini,anthropic/claude-3.5-sonnet` in `AI_MODELS`.
+The defaults use **Anthropic's Claude** (via its OpenAI-compatible endpoint).
+1. Sign in at **platform.claude.com**, add credit under **Billing** (prepaid).
+2. **API keys → Create Key**, copy the `sk-ant-...` string.
+3. Keep `AI_BASE_URL=https://api.anthropic.com/v1`,
+   `AI_MODELS=claude-sonnet-4-6,claude-opus-5-5`,
+   `AI_DEFAULT_MODEL=claude-sonnet-4-6`.
+   - If you get a "workspace" auth error, your key isn't scoped to a workspace:
+     either create the key inside a Workspace in the console, or set
+     `AI_WORKSPACE_ID` to your workspace ID.
+
+**Other providers** (no code change — just swap env vars):
+- **OpenAI:** `AI_BASE_URL=https://api.openai.com/v1`, `AI_MODELS=gpt-4o-mini,gpt-4o`.
+- **OpenRouter:** `AI_BASE_URL=https://openrouter.ai/api/v1`, models like
+  `openai/gpt-4o-mini,anthropic/claude-3.5-sonnet`.
 
 ### 4. Google sign-in
 1. Go to console.cloud.google.com → **APIs & Services → Credentials**.
